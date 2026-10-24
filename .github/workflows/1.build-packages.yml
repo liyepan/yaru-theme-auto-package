@@ -1,5 +1,6 @@
+from pathlib import Path
 
-name: Build Yaru RPM and DEB
+workflow = r'''name: Build Yaru RPM and DEB
 
 on:
   schedule:
@@ -27,14 +28,12 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      
       - name: Install build dependencies
         shell: bash
         run: |
           set -euo pipefail
 
           sudo apt-get update
-
           sudo apt-get install -y \
             ca-certificates \
             curl \
@@ -58,24 +57,15 @@ jobs:
             fakeroot \
             rpm
 
-          # Install a Meson version newer than the upstream minimum.
+          # Upstream requires Meson >= 1.4.0; Ubuntu's apt version may be older.
           python3 -m venv "$RUNNER_TEMP/meson-venv"
-          "$RUNNER_TEMP/meson-venv/bin/pip" install --upgrade pip
-          "$RUNNER_TEMP/meson-venv/bin/pip" install 'meson>=1.4.0,<2.0'
-
-          echo "$RUNNER_TEMP/meson-venv/bin" >> "$GITHUB_PATH"
-
-          # Install a Meson version newer than the upstream minimum.
-          python3 -m venv "$RUNNER_TEMP/meson-venv"
-
           "$RUNNER_TEMP/meson-venv/bin/python" -m pip install --upgrade pip
           "$RUNNER_TEMP/meson-venv/bin/python" -m pip install 'meson>=1.4.0,<2.0'
 
-          # Make Meson available in both the current step and later steps.
+          # GITHUB_PATH applies to later steps; export also updates this shell.
           export PATH="$RUNNER_TEMP/meson-venv/bin:$PATH"
           echo "$RUNNER_TEMP/meson-venv/bin" >> "$GITHUB_PATH"
 
-          # Verify that the expected executable is being used.
           command -v meson
           meson --version
           ninja --version
@@ -100,7 +90,7 @@ jobs:
             tag="$(jq -er '.tag_name' release.json)"
             source_type="release"
           else
-            echo "No latest formal release; falling back to latest Git tag."
+            echo "No latest formal release; falling back to latest numeric Git tag."
 
             curl -fsSL --retry 3 \
               -H "Accept: application/vnd.github+json" \
@@ -108,7 +98,7 @@ jobs:
               -o tags.json
 
             tag="$(jq -er '
-              [.[] | select(.name | test("^[0-9]+(\\.[0-9]+)+$"))]
+              [.[] | select(.name | test("^v?[0-9]+(\\.[0-9]+)+$"))]
               | first
               | .name
             ' tags.json)"
@@ -118,7 +108,6 @@ jobs:
 
           version="${tag#v}"
 
-          # Keep the package version compatible with Debian and RPM.
           if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
             echo "Unsupported upstream version: $tag"
             exit 1
@@ -129,6 +118,7 @@ jobs:
           echo "source_type=$source_type" >> "$GITHUB_OUTPUT"
 
           echo "Upstream tag: $tag"
+          echo "Package version: $version"
           echo "Source type: $source_type"
 
       - name: Check existing published release
@@ -167,7 +157,7 @@ jobs:
               "yaru-theme-${VERSION}-1.noarch.rpm" <<< "$assets" &&
              grep -Fxq \
               "yaru-theme_${VERSION}-1_all.deb" <<< "$assets"; then
-            echo "Version $VERSION already has both packages."
+            echo "Version $VERSION already has both packages; skipping build."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "Existing release is incomplete; rebuilding."
@@ -184,7 +174,6 @@ jobs:
           mkdir -p work/source work/stage dist
 
           url="https://github.com/ubuntu/yaru/archive/refs/tags/${TAG}.tar.gz"
-
           curl -fL --retry 3 "$url" -o work/yaru.tar.gz
 
           tar -tzf work/yaru.tar.gz >/dev/null
@@ -230,8 +219,9 @@ jobs:
 
           test -d work/stage/usr/share
 
-          echo "Installed resource directories:"
-          find work/stage/usr/share -maxdepth 2 -type d | head -100
+          echo "Installed resource directories (first 100):"
+          find work/stage/usr/share -maxdepth 2 -type d -print |
+            sed -n '1,100p'
 
           # Include upstream licensing information in both packages.
           license_dir="work/stage/usr/share/licenses/yaru-theme"
@@ -248,7 +238,7 @@ jobs:
           done
 
           if [[ -z "$(find "$license_dir" -type f -print -quit)" ]]; then
-            echo "No license files found."
+            echo "No license files found in the upstream source."
             exit 1
           fi
 
@@ -262,7 +252,6 @@ jobs:
 
           pkg="work/deb"
           mkdir -p "$pkg/DEBIAN"
-
           cp -a work/stage/usr "$pkg/"
 
           cat > "$pkg/DEBIAN/control" <<EOF
@@ -289,24 +278,21 @@ jobs:
           set -euo pipefail
 
           top="$RUNNER_TEMP/rpmbuild"
-
           mkdir -p "$top"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
 
           # Archive the entire staged installation tree.
-          tar -czf "$top/SOURCES/payload.tar.gz" \
-            -C work/stage .
+          tar -czf "$top/SOURCES/payload.tar.gz" -C work/stage .
 
-          # Generate an explicit file manifest from the actual build.
-          find work/stage/usr -type f -o -type l |
-            sed "s#^work/stage##" |
-            LC_ALL=C sort \
-            > "$top/SOURCES/files.list"
+          # Create a manifest containing every packaged file and symlink.
+          find work/stage/usr \( -type f -o -type l \) -print |
+            sed 's#^work/stage##' |
+            LC_ALL=C sort > "$top/SOURCES/files.list"
 
           test -s "$top/SOURCES/files.list"
 
-          cat > "$top/SPECS/yaru-theme.spec" <<'EOF'
+          cat > "$top/SPECS/yaru-theme.spec" <<EOF
           Name:           yaru-theme
-          Version:        %{_version}
+          Version:        ${VERSION}
           Release:        1
           Summary:        Ubuntu Yaru desktop theme suite
           License:        Mixed; see packaged license files
@@ -326,34 +312,20 @@ jobs:
           tar -xzf %{SOURCE0} -C %{buildroot}
 
           %files -f %{SOURCE1}
-
-          %changelog
-          * Sat Oct 24 2026 Automated Package Builder <noreply@example.com> - %{version}-1
-          - Automated upstream release package
           EOF
-
-          # Substitute the actual version into the spec.
-          sed -i "s/%{_version}/${VERSION}/g" \
-            "$top/SPECS/yaru-theme.spec"
 
           rpmbuild -bb \
             --define "_topdir $top" \
             "$top/SPECS/yaru-theme.spec"
 
-          rpm_file="$(find "$top/RPMS" -type f \
-            -name '*.rpm' -print -quit)"
-
+          rpm_file="$(find "$top/RPMS" -type f -name '*.rpm' -print -quit)"
           if [[ -z "$rpm_file" ]]; then
-            echo "ERROR: RPM package not found"
+            echo "ERROR: RPM package not found."
             exit 1
           fi
 
           target="dist/yaru-theme-${VERSION}-1.noarch.rpm"
-
-          # Copy only if the destination is different.
-          if [[ "$rpm_file" != "$target" ]]; then
-            cp "$rpm_file" "$target"
-          fi
+          cp "$rpm_file" "$target"
 
           test -s "$target"
           echo "Built RPM: $target"
@@ -372,24 +344,37 @@ jobs:
           test -s "$deb"
           test -s "$rpm"
 
+          echo "===== DEB metadata ====="
           dpkg-deb --info "$deb"
-          dpkg-deb --contents "$deb"
 
+          echo "===== RPM metadata ====="
           rpm -qpi "$rpm"
-          rpm -qlp "$rpm"
 
-          # Both packages must contain installed theme resources.
-          dpkg-deb --contents "$deb" |
-            grep -E 'usr/share/(themes|icons|sounds|gnome-shell)/' \
-            sed -n '1,20p'
+          # Save complete listings to files first. This avoids early pipe
+          # closure (e.g. tar SIGPIPE) and keeps the Actions log readable.
+          deb_list="$RUNNER_TEMP/yaru-deb-contents.txt"
+          rpm_list="$RUNNER_TEMP/yaru-rpm-contents.txt"
 
-          rpm -qlp "$rpm" |
-            grep -E '^/usr/share/(themes|icons|sounds|gnome-shell)/' \
-            sed -n '1,20p'
+          dpkg-deb --contents "$deb" > "$deb_list"
+          rpm -qlp "$rpm" > "$rpm_list"
 
-          # Ensure the package is not empty.
-          deb_count="$(dpkg-deb --contents "$deb" | wc -l)"
-          rpm_count="$(rpm -qlp "$rpm" | wc -l)"
+          echo "===== DEB theme resources (first 30 matches) ====="
+          grep -E 'usr/share/(themes|icons|sounds|gnome-shell)/' "$deb_list" |
+            sed -n '1,30p'
+
+          echo "===== RPM theme resources (first 30 matches) ====="
+          grep -E '^/usr/share/(themes|icons|sounds|gnome-shell)/' "$rpm_list" |
+            sed -n '1,30p'
+
+          # Require actual theme resources in both packages.
+          grep -Eq 'usr/share/(themes|icons|sounds|gnome-shell)/' "$deb_list"
+          grep -Eq '^/usr/share/(themes|icons|sounds|gnome-shell)/' "$rpm_list"
+
+          deb_count="$(wc -l < "$deb_list")"
+          rpm_count="$(wc -l < "$rpm_list")"
+
+          echo "DEB file count: $deb_count"
+          echo "RPM file count: $rpm_count"
 
           test "$deb_count" -gt 10
           test "$rpm_count" -gt 10
@@ -431,7 +416,7 @@ jobs:
           - RPM: Fedora, AlmaLinux and other RPM-based distributions
           - DEB: Debian, Ubuntu and other DEB-based distributions
 
-          The packages contain the resources installed by the upstream Meson build." \
+          These packages contain the resources installed by the upstream Meson build." \
               --target "$GITHUB_SHA"
           fi
 
@@ -441,3 +426,10 @@ jobs:
             --clobber
 
           echo "Published release: $release_tag"
+'''
+
+path = Path("/mnt/data/1.build-packages.yml")
+path.write_text(workflow, encoding="utf-8")
+print(f"已生成完整工作流文件：{path}")
+print(f"总行数：{len(workflow.splitlines())}")
+
