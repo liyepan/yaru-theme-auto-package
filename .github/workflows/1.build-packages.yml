@@ -381,11 +381,11 @@ jobs:
           # Both packages must contain installed theme resources.
           dpkg-deb --contents "$deb" |
             grep -E 'usr/share/(themes|icons|sounds|gnome-shell)/' \
-            | head -20
+            sed -n '1,20p'
 
           rpm -qlp "$rpm" |
             grep -E '^/usr/share/(themes|icons|sounds|gnome-shell)/' \
-            | head -20
+            sed -n '1,20p'
 
           # Ensure the package is not empty.
           deb_count="$(dpkg-deb --contents "$deb" | wc -l)"
