@@ -1,0 +1,419 @@
+
+name: Build Yaru RPM and DEB
+
+on:
+  schedule:
+    # Daily at 10:30 Beijing time (02:30 UTC)
+    - cron: "30 2 * * *"
+
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: "Rebuild and replace assets for an existing release"
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: yaru-packages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build Yaru RPM and DEB
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            ca-certificates \
+            curl \
+            jq \
+            git \
+            tar \
+            gzip \
+            build-essential \
+            meson \
+            ninja-build \
+            pkg-config \
+            sassc \
+            libgtk-3-dev \
+            libglib2.0-dev \
+            libxml2-utils \
+            inkscape \
+            optipng \
+            ruby \
+            dpkg-dev \
+            fakeroot \
+            rpm
+
+      - name: Get latest upstream version
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          api="https://api.github.com/repos/ubuntu/yaru"
+          http_code="$(
+            curl -sSL --retry 3 \
+              -H "Accept: application/vnd.github+json" \
+              -o release.json \
+              -w '%{http_code}' \
+              "$api/releases/latest"
+          )"
+
+          if [[ "$http_code" == "200" ]] &&
+             jq -e '.tag_name != null' release.json >/dev/null; then
+            tag="$(jq -er '.tag_name' release.json)"
+            source_type="release"
+          else
+            echo "No latest formal release; falling back to latest Git tag."
+
+            curl -fsSL --retry 3 \
+              -H "Accept: application/vnd.github+json" \
+              "$api/tags?per_page=100" \
+              -o tags.json
+
+            tag="$(jq -er '
+              [.[] | select(.name | test("^[0-9]+(\\.[0-9]+)+$"))]
+              | first
+              | .name
+            ' tags.json)"
+
+            source_type="tag"
+          fi
+
+          version="${tag#v}"
+
+          # Keep the package version compatible with Debian and RPM.
+          if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+            echo "Unsupported upstream version: $tag"
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "source_type=$source_type" >> "$GITHUB_OUTPUT"
+
+          echo "Upstream tag: $tag"
+          echo "Source type: $source_type"
+
+      - name: Check existing published release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+          FORCE: ${{ inputs.force_rebuild }}
+          EVENT: ${{ github.event_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_tag="yaru-${TAG}"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+          if [[ "$EVENT" == "workflow_dispatch" &&
+                "$FORCE" == "true" ]]; then
+            echo "Forced rebuild requested."
+            exit 0
+          fi
+
+          if ! gh release view "$release_tag" \
+              --repo "$REPOSITORY" >/dev/null 2>&1; then
+            echo "No published package release for $VERSION."
+            exit 0
+          fi
+
+          assets="$(gh release view "$release_tag" \
+            --repo "$REPOSITORY" \
+            --json assets --jq '.assets[].name')"
+
+          if grep -Fxq \
+              "yaru-theme-${VERSION}-1.noarch.rpm" <<< "$assets" &&
+             grep -Fxq \
+              "yaru-theme_${VERSION}-1_all.deb" <<< "$assets"; then
+            echo "Version $VERSION already has both packages."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Existing release is incomplete; rebuilding."
+          fi
+
+      - name: Download upstream source
+        if: steps.check.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p work/source work/stage dist
+
+          url="https://github.com/ubuntu/yaru/archive/refs/tags/${TAG}.tar.gz"
+
+          curl -fL --retry 3 "$url" -o work/yaru.tar.gz
+
+          tar -tzf work/yaru.tar.gz >/dev/null
+          tar -xzf work/yaru.tar.gz \
+            --strip-components=1 \
+            -C work/source
+
+          test -f work/source/meson.build
+          test -f work/source/meson_options.txt
+
+          echo "Upstream source downloaded successfully."
+
+      - name: Configure Yaru
+        if: steps.check.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          meson setup \
+            work/source/build \
+            work/source \
+            --prefix=/usr \
+            --buildtype=release
+
+      - name: Build Yaru
+        if: steps.check.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          meson compile \
+            -C work/source/build \
+            --jobs 2
+
+      - name: Install into staging directory
+        if: steps.check.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DESTDIR="$GITHUB_WORKSPACE/work/stage" \
+            meson install -C work/source/build
+
+          test -d work/stage/usr/share
+
+          echo "Installed resource directories:"
+          find work/stage/usr/share -maxdepth 2 -type d | head -100
+
+          # Include upstream licensing information in both packages.
+          license_dir="work/stage/usr/share/licenses/yaru-theme"
+          mkdir -p "$license_dir"
+
+          for license in \
+            COPYING \
+            COPYING.LGPL-2.1 \
+            COPYING.LGPL-3.0 \
+            LICENSE_CCBYSA; do
+            if [[ -f "work/source/$license" ]]; then
+              cp "work/source/$license" "$license_dir/"
+            fi
+          done
+
+          if [[ -z "$(find "$license_dir" -type f -print -quit)" ]]; then
+            echo "No license files found."
+            exit 1
+          fi
+
+      - name: Build DEB package
+        if: steps.check.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          pkg="work/deb"
+          mkdir -p "$pkg/DEBIAN"
+
+          cp -a work/stage/usr "$pkg/"
+
+          cat > "$pkg/DEBIAN/control" <<EOF
+          Package: yaru-theme
+          Version: ${VERSION}-1
+          Section: gnome
+          Priority: optional
+          Architecture: all
+          Maintainer: Automated Package Builder
+          Description: Ubuntu Yaru desktop theme suite
+           GTK, GNOME Shell, icon, cursor and other Yaru theme resources.
+          EOF
+
+          dpkg-deb --root-owner-group --build \
+            "$pkg" \
+            "dist/yaru-theme_${VERSION}-1_all.deb"
+
+      - name: Build RPM package
+        if: steps.check.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          top="$RUNNER_TEMP/rpmbuild"
+
+          mkdir -p "$top"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+
+          # Archive the entire staged installation tree.
+          tar -czf "$top/SOURCES/payload.tar.gz" \
+            -C work/stage .
+
+          # Generate an explicit file manifest from the actual build.
+          find work/stage/usr -type f -o -type l |
+            sed "s#^work/stage##" |
+            LC_ALL=C sort \
+            > "$top/SOURCES/files.list"
+
+          test -s "$top/SOURCES/files.list"
+
+          cat > "$top/SPECS/yaru-theme.spec" <<'EOF'
+          Name:           yaru-theme
+          Version:        %{_version}
+          Release:        1
+          Summary:        Ubuntu Yaru desktop theme suite
+          License:        Mixed; see packaged license files
+          BuildArch:      noarch
+          Source0:        payload.tar.gz
+          Source1:        files.list
+
+          %description
+          Ubuntu Yaru GTK, GNOME Shell, icon, cursor and other theme resources.
+
+          %prep
+
+          %build
+
+          %install
+          mkdir -p %{buildroot}
+          tar -xzf %{SOURCE0} -C %{buildroot}
+
+          %files -f %{SOURCE1}
+
+          %changelog
+          * Sat Oct 24 2026 Automated Package Builder <noreply@example.com> - %{version}-1
+          - Automated upstream release package
+          EOF
+
+          # Substitute the actual version into the spec.
+          sed -i "s/%{_version}/${VERSION}/g" \
+            "$top/SPECS/yaru-theme.spec"
+
+          rpmbuild -bb \
+            --define "_topdir $top" \
+            "$top/SPECS/yaru-theme.spec"
+
+          rpm_file="$(find "$top/RPMS" -type f \
+            -name '*.rpm' -print -quit)"
+
+          if [[ -z "$rpm_file" ]]; then
+            echo "ERROR: RPM package not found"
+            exit 1
+          fi
+
+          target="dist/yaru-theme-${VERSION}-1.noarch.rpm"
+
+          # Copy only if the destination is different.
+          if [[ "$rpm_file" != "$target" ]]; then
+            cp "$rpm_file" "$target"
+          fi
+
+          test -s "$target"
+          echo "Built RPM: $target"
+
+      - name: Validate packages
+        if: steps.check.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          deb="dist/yaru-theme_${VERSION}-1_all.deb"
+          rpm="dist/yaru-theme-${VERSION}-1.noarch.rpm"
+
+          test -s "$deb"
+          test -s "$rpm"
+
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+
+          rpm -qpi "$rpm"
+          rpm -qlp "$rpm"
+
+          # Both packages must contain installed theme resources.
+          dpkg-deb --contents "$deb" |
+            grep -E 'usr/share/(themes|icons|sounds|gnome-shell)/' \
+            | head -20
+
+          rpm -qlp "$rpm" |
+            grep -E '^/usr/share/(themes|icons|sounds|gnome-shell)/' \
+            | head -20
+
+          # Ensure the package is not empty.
+          deb_count="$(dpkg-deb --contents "$deb" | wc -l)"
+          rpm_count="$(rpm -qlp "$rpm" | wc -l)"
+
+          test "$deb_count" -gt 10
+          test "$rpm_count" -gt 10
+
+          echo "Both packages validated successfully."
+
+      - name: Upload build artifacts
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: yaru-theme-${{ steps.release.outputs.version }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_tag="yaru-${TAG}"
+
+          if ! gh release view "$release_tag" \
+              --repo "$REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$release_tag" \
+              --repo "$REPOSITORY" \
+              --title "Yaru ${VERSION} - RPM and DEB" \
+              --notes "Automated RPM and DEB packages for Ubuntu Yaru ${TAG}.
+
+          Upstream: https://github.com/ubuntu/yaru/tree/${TAG}
+
+          Packages:
+          - RPM: Fedora, AlmaLinux and other RPM-based distributions
+          - DEB: Debian, Ubuntu and other DEB-based distributions
+
+          The packages contain the resources installed by the upstream Meson build." \
+              --target "$GITHUB_SHA"
+          fi
+
+          gh release upload "$release_tag" \
+            dist/*.rpm dist/*.deb \
+            --repo "$REPOSITORY" \
+            --clobber
+
+          echo "Published release: $release_tag"
