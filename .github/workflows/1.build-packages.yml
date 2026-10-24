@@ -27,6 +27,7 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
+      
       - name: Install build dependencies
         shell: bash
         run: |
@@ -41,8 +42,9 @@ jobs:
             git \
             tar \
             gzip \
+            python3-pip \
+            python3-venv \
             build-essential \
-            meson \
             ninja-build \
             pkg-config \
             sassc \
@@ -55,6 +57,16 @@ jobs:
             dpkg-dev \
             fakeroot \
             rpm
+
+          # Install a Meson version newer than the upstream minimum.
+          python3 -m venv "$RUNNER_TEMP/meson-venv"
+          "$RUNNER_TEMP/meson-venv/bin/pip" install --upgrade pip
+          "$RUNNER_TEMP/meson-venv/bin/pip" install 'meson>=1.4.0,<2.0'
+
+          echo "$RUNNER_TEMP/meson-venv/bin" >> "$GITHUB_PATH"
+
+          meson --version
+          ninja --version
 
       - name: Get latest upstream version
         id: release
