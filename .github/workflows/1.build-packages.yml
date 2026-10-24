@@ -65,6 +65,18 @@ jobs:
 
           echo "$RUNNER_TEMP/meson-venv/bin" >> "$GITHUB_PATH"
 
+          # Install a Meson version newer than the upstream minimum.
+          python3 -m venv "$RUNNER_TEMP/meson-venv"
+
+          "$RUNNER_TEMP/meson-venv/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/meson-venv/bin/python" -m pip install 'meson>=1.4.0,<2.0'
+
+          # Make Meson available in both the current step and later steps.
+          export PATH="$RUNNER_TEMP/meson-venv/bin:$PATH"
+          echo "$RUNNER_TEMP/meson-venv/bin" >> "$GITHUB_PATH"
+
+          # Verify that the expected executable is being used.
+          command -v meson
           meson --version
           ninja --version
 
