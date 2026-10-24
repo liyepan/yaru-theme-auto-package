@@ -1,6 +1,4 @@
-from pathlib import Path
-
-workflow = r'''name: Build Yaru RPM and DEB
+name: Build Yaru RPM and DEB
 
 on:
   schedule:
@@ -426,10 +424,3 @@ jobs:
             --clobber
 
           echo "Published release: $release_tag"
-'''
-
-path = Path("/mnt/data/1.build-packages.yml")
-path.write_text(workflow, encoding="utf-8")
-print(f"已生成完整工作流文件：{path}")
-print(f"总行数：{len(workflow.splitlines())}")
-
